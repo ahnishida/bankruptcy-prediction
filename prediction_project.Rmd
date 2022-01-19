@@ -1,0 +1,662 @@
+---
+title: "Prediction Bankruptcy project"
+author: "Alex Nishida"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: 
+      collapsed: false
+    theme: united
+  pdf_document: default
+---
+
+```{r,include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+knitr::opts_knit$set(root.dir ='/stor/home/an25562/STA235/prediction_project')
+
+```
+
+```{r,include=FALSE}
+library(parallel)
+library(doParallel)
+library(tidyverse)
+library(caret)
+library(rsample)
+library(recipes)
+library(ipred)
+library(rpart)
+library(glmnet)
+library(randomForest)
+library(gbm)
+library(nice)
+library(vip)
+library(caretEnsemble)
+```
+
+## Companies Bankruptcy
+
+#### Source Information
+Data from:
+
+Liang, D., Lu, C.-C., Tsai, C.-F., and Shih, G.-A. (2016). “Financial Ratios and Corporate Governance Indicators in Bankruptcy Prediction: A Comprehensive Study”. European Journal of Operational Research, vol. 252, no. 2, pp. 561-572.
+
+#### Dataset information
+The data were collected from the Taiwan Economic Journal for the years 1999 to 2009. Company bankruptcy was defined based on the business regulations of the Taiwan Stock Exchange.
+
+Bankrupt is the target variable and the remaining 95 features are all numeric, and describe company attributes such as operating expenses, tax rate, income, debt, cashflow, and more. See https://www.kaggle.com/fedesoriano/company-bankruptcy-prediction for a full description of attributes. 
+
+### Objectives
+The main objective is to create a model that identifies companies that are going to file for bankruptcy. Let's imagine we're working for a major Bank in Taiwan and we are part of their data science team. The bank is highly risk-adverse, a false negative (failing to identify a company about to go bankrupt) is way worse than a false positive (a solvent company incorrectly identified as being at risk of bankruptcy). 
+
+What's the current system for indentifying bankruptcy risk? Let's imagine that currently the downstream team that vets potential loans between the bank and large companies manually examines a hand full of ratios to raise red flags, but they are wondering 
+
+1) Develop a predictive model that can objectively and quickly evaluate companies, which values high recall, they would rather be safe than sorry. When we ask them how much of a dip in precision they are willing to tolerate, they don't really know the answer to the question, so we decide to come back to it later. 
+
+2) Identify additional metrics or patterns they should consider using to indicate companies at risk of bankruptcy
+
+#### Background knowledge
+Before developing a predictive model it's useful to have a basic understanding of which metrics, including profitability ratios, income ratios, and liquidity ratios, financial institutions use to predict risk of bankruptcy. 1) The current ratio, which simply divides current assets by current liabilities, evaluates a company's ability to meet short-term debt obligations and unexpected costs for the next year. A current ratio of 2 is considered good, a ratio of less than 1 is a warning sign. 2) The relationship between Operating Cash Flow and Sales should be parallel. Investors prefer to see an increasing or at least steady ratio, as a ratio that's not increasing could indicate inefficient management of costs. 3) Debt/Equity ratio is one of the most frequent used, as it conveys how a company's finances are structured and their ability to meet debt obligations. 
+
+Source: https://www.investopedia.com/articles/active-trading/081315/financial-ratios-spot-companies-headed-bankruptcy.asp
+
+This open source article, analyzing this dataset, gives an 4-5 paragraph history of bankruptcy prediction analytics - https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0254030
+
+## Preparing the Data
+
+### Get and split the data
+The bankruptcy class is highly imbalanced. 220 out of 6819 companies in the dataset went bankrupt. In splitting the data, I make sure to stratify according to the Bankrupt variable.
+```{r}
+bankrupt_original =  as_tibble(read_csv('bankruptcy_prediction.csv')) # Yuan ¥ symbol 
+
+#before doing anything else we have to clean up these column names
+bankrupt = data.table::copy(bankrupt_original)
+bankrupt = bankrupt %>% 
+  rename('Bankrupt'= 'Bankrupt?' ) #rename target variable 
+colnames(bankrupt) <- make.names(colnames(bankrupt)) #rename column to remove prove
+
+#get an idea of bankuptcy class imbalance
+print(table(bankrupt$Bankrupt))
+p = ggplot(bankrupt, aes(as.factor(Bankrupt), fill=as.factor(Bankrupt))) + 
+  geom_bar() + 
+  theme_bw()
+print(p)
+
+set.seed(825)
+bankrupt_split <- initial_split(bankrupt, prop = 0.80, strata = Bankrupt)
+trainingS <- bankrupt_split %>% training() 
+testingS <- bankrupt_split %>% testing() #test split
+```
+
+
+### Explore the Data
+```{r}
+#get an idea of feature names and datatypes
+print(str(type_convert(trainingS)))
+```
+#### Checking for missing data and features with little variation
+```{r}
+#check for missing data
+percent_missing = vapply(trainingS, function(x) mean(is.na(x)), numeric(1))
+print('distribution of missing values')
+print(table(percent_missing)) #no missing data
+
+#check for variable with little variation using a 95/5 cutoff for the ratio of 
+#the most common value to the second most common value
+nzv = trainingS %>% 
+  nearZeroVar(freqCut = 95/5, saveMetrics=T) %>% 
+  filter(nzv==T)
+#both Liability.Assets.Flag and Net.Income.Flag exhibit near zero variation
+print(nzv)
+```
+
+#### Getting an idea of the correlation between features
+```{r}
+#get_cor matrix
+library("corrplot")
+cor = trainingS  %>% 
+  select(-rownames(nzv)) %>% 
+  cor()
+#let's look at the correlation matrix of all features, it's enough to tell us
+#that some features are highly correlated but it's too busy to pick out relationships
+corrplot(cor, is.corr=FALSE, tl.col="black", na.label=" ",tl.pos='n',order ='hclust')
+#colnames(bankrupt_original)
+```
+
+That's a lot to look at, let's visualize correlations greater than 90
+```{r}
+
+corr_simple <- function(data=df,sig=0.5){
+  #Function modified from Catherine Williams   https://towardsdatascience.com/how-to-create-a-correlation-matrix-with-too-many-variables-309cc0c0a57
+  #convert data to numeric in order to run correlations
+  #convert to factor first to keep the integrity of the data 
+  #- each value will become a number rather than turn into NA
+  df_cor <- data %>% mutate_if(is.character, as.factor)
+  df_cor <- df_cor %>% mutate_if(is.factor, as.numeric)
+  #run a correlation and drop the insignificant ones
+  corr <- cor(df_cor)
+  #prepare to drop duplicates and correlations of 1     
+  corr[lower.tri(corr,diag=TRUE)] <- NA 
+  #drop perfect correlations
+  corr[corr == 1] <- NA 
+  #turn into a 3-column table
+  corr <- as.data.frame(as.table(corr))
+  #remove the NA values from above 
+  corr <- na.omit(corr) 
+  #select significant values  
+  corr <- subset(corr, abs(Freq) > sig) 
+  #sort by highest correlation
+  corr <- corr[order(-abs(corr$Freq)),] 
+  #turn corr back into matrix in order to plot with corrplot
+  mtx_corr <- reshape2::acast(corr, Var1~Var2, value.var="Freq")
+  colnames(mtx_corr) <- substring(colnames(mtx_corr),1,20)
+  corrplot(mtx_corr, is.corr=FALSE, tl.col="black", na.label=" ")
+}
+
+corr_simple(data=trainingS,sig=0.9)
+```
+
+There are several combinations of features that are highly correlated. 
+Debt ratio and Net worth Assets are highly negatively correlated, which makes
+sense, as are Operating profit rating and Working Capital Turnover Rate. 
+Features that are highly correlated are generally related to a ratio family,
+ie liability to equity ratios. 
+
+#### Checking Pearson's coefficient of Skewness
+```{r}
+#check skew
+library(moments)
+skewness = trainingS %>% 
+  select(-rownames(nzv)) %>% 
+  moments::skewness()
+
+ggplot(as.data.frame(skewness),aes(skewness)) + 
+  geom_histogram(fill='skyblue') + 
+  theme_bw()
+```
+Many features in the data are highly skewed, this needs to be addressed in 
+the feature transforming section. 
+
+
+### Feature engineering
+Using the recipe package I eliminate features that exhibit little variation, i.e. more than 95% of values are the same. I use the step_YeoJohnson function to correct skewness among variables, this function is great because it optimizes a lambda parameter to correct skew for each individual feature. Then I step_normalize features to scale all variables. Finally, I remove features that exhibit greater than .9 correlation. At the end, I show a list of the features removed from the dataset as a result of these
+processing steps.
+```{r}
+#build pipeline for processing training data
+bankrupt_recipe <- recipe(Bankrupt ~ ., data = trainingS) 
+
+bankrupt_trans <- bankrupt_recipe %>%
+    #remove variables with near-zero variation
+    step_nzv(all_numeric(),-all_outcomes(), -has_role('id variable'),freq_cut = 95/5) %>%
+    # Correct predictors for skewness
+    step_YeoJohnson(all_numeric(),-all_outcomes(),-has_role('id variable'), ) %>%
+    # Standardize the values
+    step_normalize(all_numeric(), -all_outcomes(),-has_role('id variable')) %>%
+    # remove highly correlated predictors
+    step_corr(all_numeric(), -all_outcomes(), -has_role('id variable'), threshold = 0.8) %>%
+    prep() 
+
+#apply data transformations to both train and testing data, notice that processing parameters were fit
+#only on training data.
+trainingP <- bankrupt_trans %>% 
+              bake(new_data = trainingS) %>%
+              mutate(Bankrupt=as.factor(paste0('y',Bankrupt))) #trainControl doesn't like 0 or 1 as class names, so add y in front.
+
+#these features were eliminated 
+setdiff(colnames(trainingS),colnames(trainingP))
+```
+I pull out 30% of the training set for validation of models through training. 
+This is because we use the testing data for evaluation of the final model, 
+not as a ruler for decided which hyper-parameters are best. 
+```{r}
+#writing the training set we will hold out 30 as a validation set
+set.seed(825)
+validation_split <- initial_split(trainingP, prop = 0.70, strata = Bankrupt)
+training <- validation_split %>% training() 
+validation <- validation_split %>% testing()
+```
+
+## Model Training
+A danger in imbalanced classification problems is that people create models 
+using accuracy as a metric which can unwittingly create dummy-classifiers which
+have extremely high accuracy due but always predict the majority class for all
+the instances. For example, a dummy-classifier always predicting non-bankruptcy 
+would have an accuracy of 6599/(6599 +220) = .968, which sounds good but 
+actually provides no information. 
+
+Because of this issue, I decided to use kappa rather than accuracy as an 
+evaluation metric for training the models because Kappa weights the observed 
+accuracy with respect the expected accuracy, which in useful in imbalanced 
+datasets that can have a high expected accuracy. Kappa is highly correlated with
+the F1 score.
+
+In the next part, I wanted to compare the performance of common algothirms used 
+in binary classification tasks. For evaluating the single models, we evaluate 
+training data with a 3-fold 5-repeat cross validation using a random grid search 
+with a tune length of 10. 
+
+set up the system in run parallel jobs
+```{r}
+set.my.priority(priority = 15)
+cl <- makePSOCKcluster(30, setup_timeout = 0.5)
+registerDoParallel(cl)
+```
+
+
+### Training base models
+```{r, eval=FALSE}
+set.seed(825)
+index = createMultiFolds(y = training$Bankrupt, k = 3, times = 5)
+
+trControl = trainControl("repeatedcv", number = 3, 
+                                      repeats = 5,
+                                      classProbs = TRUE,
+                                      savePredictions="final",
+                                      returnResamp='final',
+                                      index = index,
+                                      allowParallel = TRUE)
+
+baseModels <- caretList(
+  Bankrupt ~ . , data = training,
+  metric='Kappa',
+  trControl = trControl,
+  tuneList=list(caretModelSpec(method='rpart',tuneLength=10),
+                caretModelSpec(method='rf',tuneLength=10),
+                caretModelSpec(method='svmLinear',tuneLength=10),
+                caretModelSpec(method='glm',tuneLength=10, family = "binomial"),
+                caretModelSpec(method='glmnet',tuneLength=10, family = "binomial"),
+                caretModelSpec(method='naive_bayes',tuneLength=10),
+                caretModelSpec(method='nnet',tuneLength=10)
+                )
+  )
+
+saveRDS(baseModels,'baseModels.RDS')
+
+```
+
+#### Evaluate base model performance
+In evaluating model performance, I wanted to do several things including seeing
+model performed based on the Kappa evalution metric across the repeated cv. 
+I also looked at how well the model performed on the validation set in order to 
+indicate whether over-fitting is happening. Finally, I examined model Precision-
+Recall and ROC curves. 
+```{r}
+baseModels = readRDS('baseModels.RDS')
+
+#compare models based on Kappa
+df = summary(resamples(baseModels))$values %>%
+  as.data.frame() %>%
+  pivot_longer(cols = everything()) %>%
+  separate(name,sep='~',into=c('model','metric'),remove=F) %>%
+  group_by(metric,model) %>%
+  summarize('Mean' = mean(value),'sd'=sd(value),.groups = 'drop') %>% 
+  filter(metric=='Kappa')
+  
+
+df  %>%
+  ggplot(aes(x=model, ymin=Mean-sd, ymax=Mean+sd)) +
+     geom_bar      (position=position_dodge(), aes(y=Mean), stat="identity", fill='yellow4') +
+     geom_errorbar (position=position_dodge(width=0.9), colour="black",width=.3) +
+     theme_bw() +
+     ylab('Mean Kappa')
+```
+
+The models with the best performance as random forest, neural networks, and DT 
+using rpart. SvmLinear and naive bayes performed the worst. Glm and glmnet 
+were somewhere in between. 
+
+#### Check base models performance on validation set for overfitting
+```{r}
+get_Kappa <- function(model) {
+  res = confusionMatrix(model %>% predict(validation),
+                        validation$Bankrupt,positive='y1')
+  return(res$overall['Kappa'])
+}
+
+kv = unlist(lapply(baseModels,get_Kappa))
+model = names(baseModels)
+val = data.frame(model,kv)
+df = df  %>% left_join(val,by='model') 
+
+df %>%
+  ggplot(aes(x=model, ymin=Mean-sd, ymax=Mean+sd)) +
+     geom_bar      (position=position_dodge(), aes(y=Mean), stat="identity", fill='yellow4') +
+     geom_errorbar (position=position_dodge(width=0.9), 
+                    colour="black",width=.3) +
+     geom_point    (position=position_dodge(width=0.9), 
+                    aes(y=kv),
+                    color='red', stat="identity") +
+     theme_bw() +
+     ylab('Mean Kappa') 
+```
+
+The red dot shows performance on the validation set. Model performance on 
+validation set is comparably to variability of cv performance, indicating that 
+models are not overfit. 
+
+#### Compare ROC vs Precision/Recall curves
+```{r, echo = TRUE, results = 'hide',message=FALSE}
+library(MLeval) #use this library to make curves, its noisy set echo to False
+x <- evalm(list(baseModels$glm,baseModels$glmnet,
+                baseModels$rpart,baseModels$rf,
+                baseModels$svmLinear,baseModels$naive_bayes,
+                baseModels$nnet),
+           gnames = c('glm','glmnet','rpart',
+                      'rf','svmLinear','nb',
+                      'nnet'))
+```
+We can see the precision-recall curves are more discriminate of models than 
+ROC curves. 
+
+### Sampling strategies 
+Because of the imbalanced class, I decided to compare different sampling techniques
+For each sampling strategy, a new TrainControl function is defined which keeps the
+same folds and other parameters but changes the sampling strategy. I try 1) down 
+sampling the majority class, 2) upsampling the minority class 3) ROSE (Random Over-Sampling Examples), 
+which creates a sample of synthetic data by enlarging the features space of minority and majority class,
+as well as 4) SMOTE (Synthetic Minority Oversampling Technique) which synthesizes 
+new examples for the minority class. 
+
+```{r,eval=F}
+#define Train control for all sampling strategies
+trControl_down = trainControl("repeatedcv", number = 3, 
+                                      repeats = 5,
+                                      classProbs = TRUE,
+                                      savePredictions="final",
+                                      returnResamp='final',
+                                      index = index,
+                                      allowParallel = TRUE,
+                                      sampling='down')
+trControl_up = trainControl("repeatedcv", number = 3, 
+                                      repeats = 5,
+                                      classProbs = TRUE,
+                                      savePredictions="final",
+                                      returnResamp='final',
+                                      index = index,
+                                      allowParallel = TRUE,
+                                      sampling='up')
+trControl_rose = trainControl("repeatedcv", number = 3, 
+                                      repeats = 5,
+                                      classProbs = TRUE,
+                                      savePredictions="final",
+                                      returnResamp='final',
+                                      index = index,
+                                      allowParallel = TRUE,
+                                      sampling="rose")
+trControl_smote = trainControl("repeatedcv", number = 3, 
+                                      repeats = 5,
+                                      classProbs = TRUE,
+                                      savePredictions="final",
+                                      returnResamp='final',
+                                      index = index,
+                                      allowParallel = TRUE,
+                                      sampling="smote")
+
+#Run sampling strategies on the Base Learners
+baseModels_upsample <- caretList(
+  Bankrupt ~ . , data = training,
+  metric='Kappa',
+  trControl = trControl_up,
+  tuneList=list(caretModelSpec(method='rpart',tuneLength=10),
+                caretModelSpec(method='rf',tuneLength=10),
+                caretModelSpec(method='svmLinear',tuneLength=10),
+                caretModelSpec(method='glm',tuneLength=10, family = "binomial"),
+                caretModelSpec(method='glmnet',tuneLength=10, family = "binomial"),
+                caretModelSpec(method='naive_bayes',tuneLength=10),
+                caretModelSpec(method='nnet',tuneLength=10)
+                )
+  )
+saveRDS(baseModels_upsample,'baseModels_upsample.RDS')
+
+baseModels_downsample <- caretList(
+  Bankrupt ~ . , data = training,
+  metric='Kappa',
+  trControl = trControl_down,
+  tuneList=list(caretModelSpec(method='rpart',tuneLength=10),
+                caretModelSpec(method='rf',tuneLength=10),
+                caretModelSpec(method='svmLinear',tuneLength=10),
+                caretModelSpec(method='glm',tuneLength=10, family = "binomial"),
+                caretModelSpec(method='glmnet',tuneLength=10, family = "binomial"),
+                caretModelSpec(method='naive_bayes',tuneLength=10),
+                caretModelSpec(method='nnet',tuneLength=10)
+                )
+  )        
+saveRDS(baseModels_downsample,'baseModels_downsample.RDS')
+
+baseModels_rose <- caretList(
+  Bankrupt ~ . , data = training,
+  metric='Kappa',
+  trControl = trControl_rose,
+  tuneList=list(caretModelSpec(method='rpart',tuneLength=10),
+                caretModelSpec(method='rf',tuneLength=10),
+                caretModelSpec(method='svmLinear',tuneLength=10),
+                caretModelSpec(method='glm',tuneLength=10, family = "binomial"),
+                caretModelSpec(method='glmnet',tuneLength=10, family = "binomial"),
+                caretModelSpec(method='naive_bayes',tuneLength=10),
+                caretModelSpec(method='nnet',tuneLength=10)
+                )
+  ) 
+saveRDS(baseModels_rose,'baseModels_rose.RDS')
+
+baseModels_smote <- caretList(
+  Bankrupt ~ . , data = training,
+  metric='Kappa',
+  trControl = trControl_smote,
+  tuneList=list(caretModelSpec(method='rpart',tuneLength=10),
+                caretModelSpec(method='rf',tuneLength=10),
+                caretModelSpec(method='svmLinear',tuneLength=10),
+                caretModelSpec(method='glm',tuneLength=10, family = "binomial"),
+                caretModelSpec(method='glmnet',tuneLength=10, family = "binomial"),
+                caretModelSpec(method='naive_bayes',tuneLength=10),
+                caretModelSpec(method='nnet',tuneLength=10)
+                )
+  ) 
+saveRDS(baseModels_smote,'baseModels_smote.RDS')
+
+```
+
+#### Evaluating sampling strategies
+```{r}
+baseModels_upsample = readRDS('baseModels_upsample.RDS')
+baseModels_downsample = readRDS('baseModels_downsample.RDS')
+baseModels_rose = readRDS('baseModels_rose.RDS')
+baseModels_smote = readRDS('baseModels_smote.RDS')
+
+#merge results from all sampling schemes
+format_summary_df <- function(ModelList,sampling,dataset) {
+  #formats summary to be able to merge them
+  df = summary(resamples(ModelList))$values %>%
+          as.data.frame() %>%
+          pivot_longer(cols = everything()) %>%
+          separate(name,sep='~',into=c('model','metric'),remove=F) %>%
+          group_by(metric,model) %>%
+          summarize('Mean' = mean(value),'sd'=sd(value),.groups = 'drop') %>% 
+          filter(metric=='Kappa')
+  df$sampling <- sampling
+  df$dataset <- dataset
+  #get Kappa from validation set
+  val_Kappa = unlist(lapply(ModelList,get_Kappa))
+  model = names(ModelList)
+  val = data.frame(model,val_Kappa)
+  df = df  %>% left_join(val,by='model') 
+  return(df)
+}
+
+#format df for all sampling
+normal = format_summary_df(baseModels ,sampling='Normal',dataset='training')
+upsample = format_summary_df(baseModels_upsample,sampling='up',dataset='training')
+downsample = format_summary_df(baseModels_downsample,sampling='down',dataset='training')
+rose = format_summary_df(baseModels_rose,sampling='rose',dataset='training')
+smote = format_summary_df(baseModels_smote,sampling='smote',dataset='training')
+training_summary <- data.frame(rbind(normal,upsample,downsample,rose,smote))
+
+training_summary %>%
+  ggplot(aes(x=model, ymin=Mean-sd, ymax=Mean+sd, fill=sampling)) +
+     geom_bar      (position=position_dodge(), aes(x = model,y=Mean,fill=sampling), stat="identity") +
+     geom_errorbar (position=position_dodge(width=0.9), 
+                    colour="black",width=.3) +
+     geom_point    (position=position_dodge(width=0.9), 
+                    aes(y=val_Kappa),
+                    color='red', stat="identity") +
+     theme_bw() +
+     ylab('Mean Kappa') 
+```
+
+Normal sampling performs just as well as other sampling techniques for the 
+majority of base learners. The exception to this is svmLinear, where normal 
+sampling performs significantly worse. 
+
+SMOTE has consistently good performance across the learners, naive bayes and 
+SvmLinear perform better with a SMOTE sampling strategy compared to normal sampling. 
+UP sampling also has fairly consistent performance. 
+
+### Model stacking
+I wanted to investigate different strategies for model stacking. The main 
+issues to consider in stack models are to pick higher performing models whose
+performance isn't too correlated.
+```{r}
+#first up I wanted to make an ensemble model from base learners trained off
+#NORMAL SAMPLING
+
+training_summary %>% filter(sampling == 'Normal') %>% arrange(-Mean)
+#choosing rf, nnet, and rpart, glmnet, glm bc they performed best
+
+modelCor(resamples(baseModels[c('rf','nnet','rpart','glmnet','glm')]))
+#rf and nnt are not at all correlated,whereas rpart and rf as moderately
+
+trControl_ensemble =trainControl(
+      method="boot",
+      number=10,
+      savePredictions="final",
+      classProbs=TRUE
+    )
+
+#we'll use glm for stacking as it's recommended for datasets with a small number
+#of samples
+stack_normal <- caretStack(
+    baseModels[c('rf','nnet','rpart','glmnet','glm')],
+    method="glm",
+    metric="Kappa",
+    trControl=trControl_ensemble
+  )
+print(stack_normal$error)
+confusionMatrix(stack_normal %>% predict(validation),validation$Bankrupt,positive='y1')
+
+#UPSAMPLING
+training_summary %>% filter(sampling == 'up') %>% arrange(-Mean)
+#removing naive bayes
+
+modelCor(resamples(baseModels_upsample[c('rf','nnet','rpart','glmnet','glm','svmLinear')]))
+#rf and nnt are not at all correlated,whereas rpart and rf as moderately
+
+#we'll use rf for stacking 
+stack_upsample <- caretStack(
+    baseModels_upsample[c('rf','nnet','rpart','glmnet','glm','svmLinear')],
+    method="glm",
+    metric="Kappa",
+    trControl=trControl_ensemble
+  )
+print('upsampling:')
+print(stack_upsample$error)
+confusionMatrix(stack_upsample %>% predict(validation),validation$Bankrupt,positive='y1')
+
+#SMOTE
+training_summary %>% filter(sampling == 'smote') %>% arrange(-Mean)
+#including all
+
+modelCor(resamples(baseModels_smote))
+#rf and nnt are not at all correlated,whereas rpart and rf as moderately
+
+#we'll use glm for stacking as it's recommended for datasets with a small number
+#of samples
+stack_smote <- caretStack(
+    baseModels_smote,
+    method="glm",
+    metric="Kappa",
+    trControl=trControl_ensemble
+  )
+print('smote:')
+print(stack_smote$error)
+confusionMatrix(stack_smote %>% predict(validation),validation$Bankrupt,positive='y1')
+
+#ALL models
+#here I thought to try stack upsampling and normal models
+all <- c(baseModels[c('rf','nnet','rpart','glmnet','glm')],
+          baseModels_upsample[c('rf','nnet','rpart','glmnet','glm','svmLinear')])
+modelCor(resamples(all))
+
+stack_all <- caretStack(
+   all,
+    method="glm",
+    metric="Kappa",
+    trControl=trControl_ensemble
+  )
+
+print(stack_all$error)
+confusionMatrix(stack_all %>% predict(validation),validation$Bankrupt,positive='y1')
+```
+At the end of all that, the ensemble_model created from the best learners under 
+normal and up-sampling performed the best. 
+
+## Wrap-up
+
+### Objective 1: Final model evaluation
+```{r}
+testing <- bankrupt_trans %>% 
+  bake(new_data = testingS) %>% 
+  mutate(Bankrupt=as.factor(paste0('y',Bankrupt))) #
+
+confusionMatrix(stack_all %>% predict(testing),testing$Bankrupt,positive='y1')
+```
+From this model, we're able to identify 25% of the companies that
+will file for Bankruptcy (Sensitivity: .25). With this model, there's a false-positive
+rate of 60%, only 2/5 the companies identified as positive will actually end up 
+going Bankrupt. However, this meets the specifications laid out by the
+bank that they prefer a risk-averse strategy, valuing recall at the expense of 
+precision.
+
+#### Alternate universe
+Just to see the variability in how other top models would have performed 
+```{r}
+confusionMatrix(stack_normal  %>% predict(testing),testing$Bankrupt,positive='y1')
+confusionMatrix(stack_upsample %>% predict(testing),testing$Bankrupt,positive='y1')
+```
+
+
+### Objective 2: Important predictors
+The model identified Net Income to Stock holder equity as being the most important 
+factor in predicting bankruptcy followed closely by Net Value Growth rate. The 
+current ratio was also important as well as the ratios of Total Income/Total 
+expense and Net Income/Total Assets. 
+
+*1* This prediction project reaffirms the use of the already established metrics such 
+as the current ratio and the debt to equity ratio. Reaffirming these established 
+ratios gives confidence to this model. 
+
+*2* A new metric that the downstream team should consider is the Net Value 
+Growth Rate, because it provides insight into the future growth trajectory 
+of the company.
+
+*3* Other metrics for the downstream team to consider are 
+Total Income to Total expense and Net Income to Total Assets. They 
+provide a different vantage point to look for proper management of funds.
+```{r}
+print(vip::vip(stack_all$ens_model, num_features = 10, geom = "point")  + 
+  theme_bw() + ggtitle('Ensemble model'))
+
+print(vip::vip(stack_all$models$rf1, num_features = 10, geom = "point")  + 
+  theme_bw() + ggtitle('normal_RF'))
+
+print(vip::vip(stack_all$models$glmnet9, num_features = 10, geom = "point")  + 
+  theme_bw() + ggtitle('upsample_glmnet'))
+
+print(vip::vip(stack_all$models$rf6, num_features = 10, geom = "point")  + 
+  theme_bw() + ggtitle('upsample_RF'))
+```
+
+
+
+
+
+
+
